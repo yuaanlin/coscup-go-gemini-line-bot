@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -25,6 +26,11 @@ func main() {
 	channelSecret := os.Getenv("LINE_CHANNEL_SECRET")
 
 	bot, err := messaging_api.NewMessagingApiAPI(channelToken)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	blob, err := messaging_api.NewMessagingApiBlobAPI(channelToken)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -53,6 +59,8 @@ func main() {
 				switch e.Message.(type) {
 				case webhook.TextMessageContent:
 					handleTextMessage(db, bot, e)
+				case webhook.ImageMessageContent:
+					handleImageMessage(db, bot, e, blob)
 				}
 			}
 		}
@@ -141,6 +149,35 @@ func handleTextMessage(db *mongo.Database, bot *messaging_api.MessagingApiAPI, e
 	})
 }
 
+func handleImageMessage(db *mongo.Database, bot *messaging_api.MessagingApiAPI, e webhook.MessageEvent, blob *messaging_api.MessagingApiBlobAPI) {
+	message := e.Message.(webhook.ImageMessageContent)
+
+	imgData, err := readImage(blob, message.Id)
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
+
+	imageContent, err := askGemini([]genai.Part{genai.ImageData("png", imgData), genai.Text("盡可能完整地描述這張圖片，用文字紀錄這張圖片可能帶有的所有資訊，回覆的格式用「一張 xxx 圖片」開頭。")})
+	if err != nil {
+		log.Println(err.Error())
+		_, _ = bot.ReplyMessage(&messaging_api.ReplyMessageRequest{ReplyToken: e.ReplyToken, Messages: []messaging_api.MessageInterface{messaging_api.TextMessage{Text: "抱歉，我發生了一些錯誤，暫時沒辦法看懂這張照片！"}}})
+		return
+	}
+
+	_, err = db.Collection("messages").InsertOne(context.Background(), bson.M{
+		"userID":    e.Source.(webhook.UserSource).UserId,
+		"role":      "user",
+		"type":      "image",
+		"content":   imageContent,
+		"createdAt": time.Now(),
+	})
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
+}
+
 func askGemini(data []genai.Part) (string, error) {
 	ctx := context.Background()
 
@@ -169,4 +206,20 @@ func askGemini(data []genai.Part) (string, error) {
 	}
 
 	return strings.TrimSpace(resStr), nil
+}
+
+func readImage(blob *messaging_api.MessagingApiBlobAPI, messageID string) ([]byte, error) {
+	content, err := blob.GetMessageContent(messageID)
+	if err != nil {
+		return nil, fmt.Errorf("get message content: %w", err)
+	}
+
+	defer content.Body.Close()
+
+	data, err := io.ReadAll(content.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read message content: %w", err)
+	}
+
+	return data, nil
 }
